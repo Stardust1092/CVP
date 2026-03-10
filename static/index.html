@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>视觉辅助抓取系统 | COMP5523</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ── Header ─────────────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <span class="logo">👁️</span>
+      <div>
+        <h1>视觉辅助抓取系统</h1>
+        <p class="subtitle">Vision-Assisted Object Grasping · COMP5523 PolyU</p>
+      </div>
+    </div>
+    <div id="ws-status" class="ws-status disconnected">
+      <span class="ws-dot"></span>
+      <span id="ws-text">连接中...</span>
+    </div>
+  </header>
+
+  <!-- ── Main layout ────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Left: Camera feed -->
+    <section class="video-section">
+      <div class="video-wrapper">
+
+        <!-- Browser camera stream -->
+        <video id="camera-view" autoplay playsinline muted></video>
+
+        <!-- Detection overlay canvas -->
+        <canvas id="overlay-canvas"></canvas>
+
+        <!-- Camera permission / start prompt -->
+        <div id="camera-prompt" class="camera-prompt">
+          <div class="camera-prompt-inner">
+            <div class="camera-icon">📷</div>
+            <p class="camera-prompt-title">启动摄像头</p>
+            <p class="camera-prompt-sub">需要摄像头权限来启动视觉辅助系统</p>
+            <button id="start-camera-btn" class="start-camera-btn" onclick="startCamera()">
+              启动摄像头
+            </button>
+            <p id="camera-error" class="camera-error"></p>
+          </div>
+        </div>
+
+        <!-- Camera controls (shown after camera starts) -->
+        <div id="camera-controls" class="camera-controls hidden">
+          <button class="cam-ctrl-btn" onclick="switchCamera()" title="切换摄像头">⟳</button>
+          <button class="cam-ctrl-btn" id="mirror-btn" onclick="toggleMirror()" title="镜像翻转">⇔</button>
+        </div>
+
+        <!-- Direction compass overlay -->
+        <div class="compass" id="compass">
+          <button class="c-arrow c-up"    id="arr-up"   >▲</button>
+          <button class="c-arrow c-right" id="arr-right">▶</button>
+          <button class="c-arrow c-down"  id="arr-down" >▼</button>
+          <button class="c-arrow c-left"  id="arr-left" >◀</button>
+          <div    class="c-center"        id="c-center" ></div>
+        </div>
+      </div>
+
+      <!-- Big guidance banner below video -->
+      <div id="guidance-banner" class="guidance-banner idle">
+        <span id="guidance-icon">⌛</span>
+        <span id="guidance-text">请先启动摄像头并设置目标物体</span>
+      </div>
+    </section>
+
+    <!-- Right: Control panel -->
+    <aside class="sidebar">
+
+      <!-- Target card -->
+      <div class="card target-card">
+        <div class="card-title">🎯 目标物体</div>
+
+        <div id="target-chip" class="target-chip empty">未设置</div>
+
+        <!-- Voice button -->
+        <button id="mic-btn" class="mic-btn" onclick="toggleASR()">
+          <span id="mic-icon">🎤</span>
+          <span id="mic-label">语音识别</span>
+        </button>
+        <div id="asr-hint" class="asr-hint"></div>
+
+        <!-- Quick-pick grid -->
+        <div class="quick-title">快速选择</div>
+        <div class="quick-grid">
+          <button onclick="setTarget('瓶子')">🍶 瓶子</button>
+          <button onclick="setTarget('杯子')">☕ 杯子</button>
+          <button onclick="setTarget('手机')">📱 手机</button>
+          <button onclick="setTarget('苹果')">🍎 苹果</button>
+          <button onclick="setTarget('书')">📖 书</button>
+          <button onclick="setTarget('碗')">🥣 碗</button>
+          <button onclick="setTarget('香蕉')">🍌 香蕉</button>
+          <button onclick="setTarget('鼠标')">🖱️ 鼠标</button>
+        </div>
+
+        <button class="clear-btn" onclick="clearTarget()">✕ 清除目标</button>
+      </div>
+
+      <!-- Status card -->
+      <div class="card status-card">
+        <div class="card-title">📊 实时状态</div>
+        <div class="status-rows">
+          <div class="status-row">
+            <span class="s-label">摄像头</span>
+            <span id="s-camera" class="badge inactive">未启动</span>
+          </div>
+          <div class="status-row">
+            <span class="s-label">手部检测</span>
+            <span id="s-hand" class="badge inactive">未检测</span>
+          </div>
+          <div class="status-row">
+            <span class="s-label">目标检测</span>
+            <span id="s-target" class="badge inactive">未检测</span>
+          </div>
+          <div class="status-row">
+            <span class="s-label">手势状态</span>
+            <span id="s-pose" class="badge neutral">---</span>
+          </div>
+          <div class="status-row">
+            <span class="s-label">引导阶段</span>
+            <span id="s-state" class="badge neutral">空闲</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- History card -->
+      <div class="card history-card">
+        <div class="card-title">
+          📝 指令历史
+          <button class="history-clear-btn" onclick="clearHistory()">清空</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty">暂无记录</div>
+        </div>
+      </div>
+
+      <!-- TTS toggle -->
+      <div class="card tts-card">
+        <div class="card-title">🔊 语音播报</div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tts-toggle" checked onchange="onTTSToggle(this)" />
+          <span class="toggle-slider"></span>
+          <span class="toggle-label" id="tts-label">已开启</span>
+        </label>
+      </div>
+
+    </aside>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

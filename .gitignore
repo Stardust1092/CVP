@@ -1,0 +1,28 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Models / large binaries
+*.pt
+*.task
+
+# Local data
+*.sqlite
+
+# Frontend build (if added later)
+/dist/
+/build/
