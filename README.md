@@ -1,4 +1,4 @@
-<![CDATA[# Vision-Assisted Object Grasping System
+# Vision-Assisted Object Grasping System
 
 **Real-time computer vision guidance for visually impaired users** — COMP5523 Group Project, The Hong Kong Polytechnic University
 
@@ -135,4 +135,3 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for the full API reference, architecture de
 ## Acknowledgements
 
 [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) · [Google MediaPipe](https://ai.google.dev/edge/mediapipe) · [FastAPI](https://fastapi.tiangolo.com/) · COMP5523, PolyU
-]]>

@@ -1,4 +1,4 @@
-<![CDATA[# Development Guide
+# Development Guide
 
 > **Vision-Assisted Object Grasping System** · COMP5523 · PolyU
 > Internal reference for contributors and maintainers. Last updated: 2026-03-12.
@@ -631,4 +631,3 @@ Replace the `CLOSE_DISTANCE_RATIO` heuristic with a depth model (e.g. MiDaS) to 
 ---
 
 *For questions about the project, open an issue in the repository.*
-]]>
