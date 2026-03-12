@@ -6,3 +6,4 @@ ultralytics>=8.1.0
 numpy>=1.24.0
 python-multipart>=0.0.9
 websockets>=12.0
+cryptography>=42.0.0

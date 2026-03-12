@@ -87,6 +87,9 @@ async function startCamera() {
     // Auto-mirror display for front camera (matches physical left/right for user)
     _applyMirror(facingMode === 'user');
 
+    // Unlock Web Speech API on mobile (requires a user-gesture call to speak())
+    _unlockTTS();
+
     // Start sending frames to server
     startFrameCapture();
 
@@ -116,10 +119,11 @@ async function switchCamera() {
 function _applyMirror(enable) {
   isMirrored = enable;
   const videoEl = document.getElementById('camera-view');
-  const canvas  = document.getElementById('overlay-canvas');
   const btn     = document.getElementById('mirror-btn');
+  // Only mirror the video display; canvas overlay stays un-transformed because
+  // server coordinates are already in flipped-frame space and must be drawn
+  // straight onto the canvas to align with the CSS-mirrored video.
   videoEl.classList.toggle('mirrored', isMirrored);
-  canvas.classList.toggle('mirrored', isMirrored);
   if (btn) btn.classList.toggle('active', isMirrored);
 }
 
@@ -493,8 +497,22 @@ function setASRHint(text) {
 
 // ─── Web Speech API – TTS ─────────────────────────────────────────────────────
 
-let ttsQueue   = [];
+let ttsQueue    = [];
 let ttsSpeaking = false;
+let ttsUnlocked = false;
+
+/**
+ * Must be called from within a user-gesture handler (e.g. button click).
+ * Speaks a silent utterance to unlock Web Speech API on iOS / Android,
+ * where speechSynthesis.speak() is blocked until the first gesture.
+ */
+function _unlockTTS() {
+  if (ttsUnlocked || !('speechSynthesis' in window)) return;
+  ttsUnlocked = true;
+  const utt = new SpeechSynthesisUtterance('');
+  utt.volume = 0;
+  speechSynthesis.speak(utt);
+}
 
 function speak(text) {
   if (!ttsEnabled || !text) return;
@@ -516,8 +534,10 @@ function drainTTS() {
   utt.rate   = 1.1;
   utt.pitch  = 1.0;
   utt.volume = 1.0;
-  const voices   = speechSynthesis.getVoices();
-  const zhVoice  = voices.find(v => v.lang.startsWith('zh'));
+  // Prefer a Chinese voice; fall back to any available voice (mobile may
+  // only expose voices after a delay, so accept undefined = browser default)
+  const voices  = speechSynthesis.getVoices();
+  const zhVoice = voices.find(v => v.lang.startsWith('zh'));
   if (zhVoice) utt.voice = zhVoice;
   utt.onstart = () => { ttsSpeaking = true; };
   utt.onend = utt.onerror = () => { ttsSpeaking = false; drainTTS(); };

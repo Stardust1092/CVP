@@ -1,116 +1,293 @@
-﻿# Vision-Assisted Grasping System (COMP5523) 开发文档
+<![CDATA[# Development Guide
 
-文档目的: 统一项目架构理解、通信协议、关键模块职责与调参方式，方便快速上手与后续演进。
-文档日期: 2026-03-10
-
----
-
-## 1. 项目概述
-
-本项目是一个浏览器到服务端的实时视觉指导系统，用于辅助物体抓取。浏览器采集摄像头画面并以 WebSocket 发送 JPEG 帧，后端进行目标检测与手部识别，输出引导指令与状态信息回传到前端进行可视化与语音播报。
-
-核心能力:
-- 实时目标检测 (YOLOv8)
-- 手部关键点与手势识别 (MediaPipe Tasks GestureRecognizer)
-- 位置关系转引导策略 (状态机)
-- 前端可视化覆盖层、语音播报与语音输入
+> **Vision-Assisted Object Grasping System** · COMP5523 · PolyU
+> Internal reference for contributors and maintainers. Last updated: 2026-03-12.
 
 ---
 
-## 2. 技术栈
+## Table of Contents
 
-后端:
-- FastAPI
-- Uvicorn
-- OpenCV
-- Ultralytics YOLOv8
-- MediaPipe Tasks
-
-前端:
-- HTML/CSS/JavaScript
-- WebSocket 流式通信
-- Web Speech API (ASR + TTS)
+1. [Architecture Overview](#1-architecture-overview)
+2. [Repository Layout](#2-repository-layout)
+3. [Data Flow](#3-data-flow)
+4. [Module Reference](#4-module-reference)
+5. [WebSocket Protocol](#5-websocket-protocol)
+6. [REST API](#6-rest-api)
+7. [Guidance State Machine](#7-guidance-state-machine)
+8. [Configuration Reference](#8-configuration-reference)
+9. [Frontend Internals](#9-frontend-internals)
+10. [Running the Server](#10-running-the-server)
+11. [Performance & Tuning](#11-performance--tuning)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Extension Points](#13-extension-points)
 
 ---
 
-## 3. 目录结构
+## 1. Architecture Overview
+
+The system is split into a **browser-owned capture layer** and a **server-side inference layer**, connected by a single persistent WebSocket.
 
 ```
-app/
-  main.py               FastAPI 入口, WS + REST, 静态托管
-  camera_processor.py   帧处理主流程
-  detector.py           YOLOv8 封装
-  hand_tracker.py       手部识别与手势判定
-  guidance.py           引导策略状态机
-  config.py             配置与中文映射
-static/
-  index.html            前端页面
-  app.js                前端逻辑 (WS/相机/语音/绘制)
-  style.css             前端样式
-models/
-  gesture_recognizer.task  MediaPipe 模型
-  hand_landmarker.task     当前未使用
-yolov8n.pt              YOLOv8 模型文件
-run.py                  本地启动入口
-requirements.txt        依赖列表
+┌─────────────────────────────────────────────────────────┐
+│  Browser                                                │
+│                                                         │
+│  getUserMedia ──► <video> ──► captureCanvas (15 fps)    │
+│       │                             │                   │
+│       │              JPEG 0.7 quality (binary WS frame) │
+│       │                             │                   │
+│  Web Speech ASR ──► JSON text ──────┤                   │
+│                                     │                   │
+│  ◄── JSON state ◄── WebSocket /ws ◄─┘                   │
+│        │                                                │
+│  Canvas overlay                                         │
+│  (bbox · hand skeleton · direction arrow)               │
+│                                                         │
+│  Web Speech TTS ◄── guidance text                       │
+└──────────────────────────┬──────────────────────────────┘
+                           │  ws://localhost:8000/ws
+                           │  wss://<LAN-IP>:8443/ws
+┌──────────────────────────▼──────────────────────────────┐
+│  FastAPI Server (app/main.py)                           │
+│                                                         │
+│  asyncio event loop                                     │
+│    ws.receive() ──► binary ──► ThreadPoolExecutor(1)    │
+│                                   │                     │
+│                           FrameProcessor                │
+│                           ├─ ObjectDetector (YOLOv8n)   │
+│                           ├─ HandTracker (MediaPipe)    │
+│                           └─ GuidancePolicy             │
+│                                   │                     │
+│    ws.send_json() ◄───────────────┘                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+| Decision | Rationale |
+|---|---|
+| Browser-owned camera | Works over LAN without server USB/V4L access; enables mobile use |
+| Binary WebSocket (not HTTP multipart) | Lower overhead, no per-frame HTTP handshake |
+| `ThreadPoolExecutor(max_workers=1)` | Serialises YOLO + MediaPipe calls; prevents GPU memory contention |
+| `asyncio.Lock` back-pressure | Drops new frame if the previous one is still being processed, keeping the UI responsive |
+| Normalised coordinates (0–1) | Frontend overlay is resolution-independent; works at any camera resolution |
+| Self-signed TLS cert (auto-generated) | Enables `getUserMedia` on mobile over LAN without a CA-signed cert |
+
+---
+
+## 2. Repository Layout
+
+```
+CVP/
+├── app/                         # Backend Python package
+│   ├── __init__.py
+│   ├── config.py                # All tuneable constants and mappings
+│   ├── detector.py              # YOLOv8 inference wrapper
+│   ├── hand_tracker.py          # MediaPipe GestureRecognizer wrapper
+│   ├── guidance.py              # Guidance state machine
+│   ├── camera_processor.py      # Per-frame pipeline (no camera capture)
+│   └── main.py                  # FastAPI app, WebSocket + REST routes
+├── static/                      # Frontend (served as static files)
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+├── models/                      # Model weights (auto-downloaded, git-ignored)
+│   └── gesture_recognizer.task  # ~25 MB, MediaPipe float16
+├── run.py                       # CLI entry point (HTTP / HTTPS)
+├── requirements.txt
+├── cert.pem                     # Auto-generated TLS cert (git-ignored)
+├── key.pem                      # Auto-generated TLS key (git-ignored)
+└── DEVELOPMENT.md               # This file
 ```
 
 ---
 
-## 4. 快速启动
+## 3. Data Flow
 
-环境要求:
-- Python 3.10+
-- Chrome 或 Edge (相机权限与 Web Speech API 支持更好)
+### Per-frame pipeline (backend)
 
-步骤:
-1. 创建虚拟环境
-2. 安装依赖: `pip install -r requirements.txt`
-3. 启动服务: `python run.py`
-4. 浏览器访问: `http://localhost:8000`
-5. 允许摄像头权限
-6. 通过语音或快捷按钮设置目标
+```
+JPEG bytes (WebSocket binary)
+        │
+        ▼
+cv2.imdecode()  →  BGR ndarray (H×W×3)
+        │
+        ├──► ObjectDetector.detect(frame, target_class)
+        │         YOLOv8n inference (GPU)
+        │         Filter by target COCO class
+        │         Return highest-confidence bbox (x1,y1,x2,y2) or None
+        │
+        ├──► HandTracker.track(frame)
+        │         BGR → RGB conversion
+        │         MediaPipe GestureRecognizer.recognize_for_video()
+        │         Return list[NormalizedLandmark] (21 pts) or None
+        │         Side-effect: store gesture label (Open_Palm / Closed_Fist …)
+        │
+        └──► GuidancePolicy.update(hand_center, obj_bbox, hand_open, shape, target)
+                  Priority-ordered state transitions (see §7)
+                  Cooldown check  →  emit zh_text or None
+                  Return (zh_text, cv_text)
 
----
-
-## 5. 架构与数据流
-
-```mermaid
-flowchart LR
-  A["Browser Camera"] -->|JPEG frames (WS binary)| B["FastAPI /ws"]
-  B -->|Frame bytes| C["FrameProcessor"]
-  C --> D["YOLOv8 ObjectDetector"]
-  C --> E["MediaPipe HandTracker"]
-  C --> F["GuidancePolicy"]
-  F -->|Guidance text| B
-  C -->|State JSON| B
-  B -->|WS JSON: state/guidance| G["Frontend UI"]
-  G -->|Target set/clear JSON| B
+State dict (normalised coords)  →  WebSocket JSON  →  Browser
 ```
 
-关键设计点:
-- 处理背压: 处理线程忙时丢弃新帧以保证响应性
-- 单线程推理: CV/ML 在单线程执行，避免无序并行导致资源争抢
+### Frontend capture & send
+
+```
+setInterval(_captureAndSend, 1000/15)   ← 15 fps timer
+        │
+        ▼
+drawImage(videoEl)  →  _captureCanvas
+        │
+        ├── facingMode === 'user':
+        │       ctx.scale(-1, 1)  →  flip horizontally
+        │       (server receives mirrored frame → guidance L/R matches physical)
+        │
+        └── facingMode === 'environment':
+                draw as-is
+        │
+toBlob('image/jpeg', 0.7)  →  arrayBuffer  →  ws.send(buf)
+```
+
+> **Mirror invariant:** The `<video>` element is CSS-mirrored (`scaleX(-1)`) for front camera display. The canvas overlay is **not** CSS-mirrored; its server-returned coordinates (based on the flipped frame) map directly onto the mirrored video display.
 
 ---
 
-## 6. WebSocket 协议
+## 4. Module Reference
 
-客户端 -> 服务端
-1. 二进制消息: JPEG 帧
-2. 文本 JSON 消息:
+### `app/config.py`
+
+Single source of truth for all constants. No logic.
+
+```python
+YOLO_MODEL        = "yolov8n.pt"
+DETECTION_CONF    = 0.40          # YOLO confidence threshold
+DETECTION_IOU     = 0.45          # NMS IoU threshold
+MAX_HANDS         = 1
+HAND_DETECT_CONF  = 0.65
+HAND_TRACK_CONF   = 0.50
+XY_ALIGN_THRESHOLD   = 0.12      # normalised frame fraction
+CLOSE_DISTANCE_RATIO = 0.65      # relative to object longest side
+GUIDANCE_COOLDOWN_SEC = 2.5
+ZH_TO_COCO: dict[str, str]       # Chinese → COCO-80 class name
+GUIDANCE_TEXTS: dict[str, str]   # key → Chinese TTS string
+CV_TEXTS: dict[str, str]         # key → English overlay string
+```
+
+---
+
+### `app/detector.py` — `ObjectDetector`
+
+| Method | Signature | Description |
+|---|---|---|
+| `detect` | `(frame, target_class?) → list[dict]` | Run YOLOv8n; filter by class if given; sort by confidence desc |
+| `draw_detections` | `(frame, detections, target_class?) → frame` | Draw bboxes in-place (not used in WebSocket mode) |
+
+Detection dict schema:
+```python
+{ "class": "bottle", "conf": 0.87, "bbox": (x1, y1, x2, y2) }
+```
+
+---
+
+### `app/hand_tracker.py` — `HandTracker`
+
+Uses `GestureRecognizer` (MediaPipe Tasks) in `VIDEO` mode. Timestamps are forced strictly increasing via `max(perf_counter_ms, last_ts + 1)`.
+
+| Method | Returns | Description |
+|---|---|---|
+| `track(frame)` | `list[NormalizedLandmark] \| None` | Infer on one BGR frame; update `_last_gesture` |
+| `get_palm_center(lm, shape)` | `(x, y)` px | Mean of wrist + 4 MCP joints |
+| `is_hand_open(lm)` | `bool` | Uses gesture label; falls back to fingertip-spread heuristic |
+| `get_gesture_label()` | `str` | Last detected gesture name |
+
+Open gestures: `Open_Palm`, `Victory`, `ILoveYou`, `Pointing_Up`
+Close gestures: `Closed_Fist`, `Thumb_Down`, `Thumb_Up`
+
+---
+
+### `app/guidance.py` — `GuidancePolicy`
+
+Stateful class. One instance per server lifetime (shared across WS connections).
+
+| Method | Description |
+|---|---|
+| `update(hand_center, obj_bbox, hand_open, frame_shape, target_class)` | Compute next instruction; return `(zh_text, cv_text)` or `(None, None)` |
+| `get_direction_vector(hand_center, obj_bbox, frame_shape)` | Unit vector hand→object; `None` if already aligned (mag < 0.02) |
+| `reset()` | Call when target changes |
+
+**`_emit(key)`** — respects `GUIDANCE_COOLDOWN_SEC`: identical instruction repeats only after cooldown; a different instruction fires immediately.
+
+---
+
+### `app/camera_processor.py` — `FrameProcessor`
+
+Singleton created at app startup. Thread-safe via `threading.Lock` on target state.
+
+| Method | Thread-safe | Description |
+|---|---|---|
+| `set_target(text)` | ✓ | Map Chinese→COCO; reset guidance |
+| `clear_target()` | ✓ | Reset state |
+| `process_frame(jpeg_bytes)` | Executor thread | Full pipeline; returns state dict |
+| `pop_guidance()` | ✓ | Dequeue one guidance string (or `None`) |
+| `get_state()` | ✓ | Snapshot of last processed frame state |
+
+State dict keys: `hand_detected`, `target_detected`, `hand_open`, `guidance_state`, `last_guidance`, `target_class`, `target_display`, `target_bbox_norm`, `hand_center_norm`, `hand_landmarks_norm`, `direction_norm`
+
+---
+
+### `app/main.py` — FastAPI Application
+
+**WebSocket lifecycle:**
+
+```python
+await ws.accept()
+loop = asyncio.get_running_loop()
+proc_lock = asyncio.Lock()
+
+while True:
+    raw = await asyncio.wait_for(ws.receive(), timeout=1.0)
+
+    if raw["type"] == "websocket.disconnect":
+        break                         # clean exit
+
+    if raw.get("bytes"):
+        if proc_lock.locked():
+            continue                  # back-pressure: drop frame
+        async with proc_lock:
+            state = await loop.run_in_executor(_exec, processor.process_frame, raw["bytes"])
+        ...
+
+except (WebSocketDisconnect, RuntimeError):
+    pass
+```
+
+**Why `asyncio.get_running_loop()` not `get_event_loop()`:** `get_event_loop()` is deprecated in Python 3.12+ and may raise in some executor contexts.
+
+---
+
+## 5. WebSocket Protocol
+
+**Endpoint:** `ws://host:8000/ws` (HTTP) · `wss://host:8443/ws` (HTTPS)
+
+### Client → Server
+
+| Message type | Format | Description |
+|---|---|---|
+| Video frame | `bytes` (JPEG) | Raw JPEG frame from browser camera |
+| Set target | `text` (JSON) | `{"type": "set_target", "target": "瓶子"}` |
+| Clear target | `text` (JSON) | `{"type": "clear_target"}` |
+
+### Server → Client
+
+**`guidance`** — emitted when a new instruction is ready:
 ```json
-{"type": "set_target", "target": "bottle"}
-{"type": "clear_target"}
+{
+  "type": "guidance",
+  "text": "向右移动"
+}
 ```
 
-服务端 -> 客户端
-1. 引导消息:
-```json
-{"type": "guidance", "text": "<中文提示>"}
-```
-
-2. 状态消息:
+**`state`** — emitted after every processed frame:
 ```json
 {
   "type": "state",
@@ -119,203 +296,339 @@ flowchart LR
     "target_detected": true,
     "hand_open": false,
     "guidance_state": "aligning",
-    "last_guidance": "...",
+    "last_guidance": "向右移动",
     "target_class": "bottle",
-    "target_display": "水瓶",
-    "target_bbox_norm": [x1, y1, x2, y2],
-    "hand_center_norm": [x, y],
-    "hand_landmarks_norm": [[x, y], ...],
-    "direction_norm": [dx, dy]
+    "target_display": "瓶子",
+    "target_bbox_norm": [0.31, 0.18, 0.62, 0.74],
+    "hand_center_norm": [0.50, 0.50],
+    "hand_landmarks_norm": [[0.48, 0.52], "...21 total"],
+    "direction_norm": [0.71, 0.00]
   }
 }
 ```
 
-3. 目标确认:
+> All spatial values are normalised to `[0.0, 1.0]` relative to frame width/height.
+> `direction_norm` is a unit vector `[dx, dy]` from hand center to object center; `null` when already aligned (magnitude < 0.02).
+
+**`target_confirmed`**:
 ```json
-{"type": "target_confirmed", "display": "水瓶", "coco_class": "bottle"}
+{"type": "target_confirmed", "display": "瓶子", "coco_class": "bottle"}
 ```
 
-4. 目标清空:
+**`target_cleared`**:
 ```json
 {"type": "target_cleared"}
 ```
 
-坐标均为相对画面尺寸的归一化值 [0, 1]。
+---
+
+## 6. REST API
+
+Intended for testing and external integration. The WebSocket path is preferred for real-time use.
+
+### `POST /api/set_target`
+
+```http
+POST /api/set_target
+Content-Type: application/json
+
+{"target": "苹果"}
+```
+
+```json
+{"coco_class": "apple", "display": "苹果"}
+```
+
+### `POST /api/clear_target`
+
+```http
+POST /api/clear_target
+```
+
+```json
+{"status": "cleared"}
+```
+
+### `GET /api/state`
+
+Returns the same dict as the WebSocket `state.data` payload.
 
 ---
 
-## 7. REST API
+## 7. Guidance State Machine
 
-用途: 便于测试或外部系统集成。
+### States
 
-- `POST /api/set_target`
-  - Body: `{ "target": "bottle" }`
-  - Returns: `{ "coco_class": "...", "display": "..." }`
+| State | Description |
+|---|---|
+| `idle` | No target set |
+| `no_target` | Target set but not detected in frame |
+| `no_hand` | Target detected, no hand in frame |
+| `aligning` | Hand detected; guiding left/right/up/down |
+| `approaching` | XY aligned; guiding hand forward (depth) |
+| `grasping` | Hand close enough; instruct open/close |
+| `success` | Hand closed at object — task complete |
 
-- `POST /api/clear_target`
-  - Returns: `{ "status": "cleared" }`
+### Transition Logic (priority-ordered)
 
-- `GET /api/state`
-  - Returns: 最新状态 (与 WS state 一致)
+```
+target_class is None
+  └──► IDLE
 
----
+obj_bbox is None
+  └──► NO_TARGET  →  emit "no_target"
 
-## 8. 核心模块说明
+hand_center is None
+  └──► NO_HAND    →  emit "no_hand"
 
-`app/main.py`
-职责:
-- WebSocket 生命周期管理
-- 帧处理背压控制
-- REST 接口
-- 静态资源托管
+|Δx_norm| > XY_ALIGN_THRESHOLD (0.12)
+  └──► ALIGNING   →  emit "move_right" or "move_left"
 
-`app/camera_processor.py`
-职责:
-- JPEG 解码
-- 目标检测
-- 手部跟踪与手势识别
-- 引导策略调用
-- 坐标归一化与状态输出
+|Δy_norm| > XY_ALIGN_THRESHOLD (0.12)
+  └──► ALIGNING   →  emit "move_down" or "move_up"
 
-`app/detector.py`
-职责:
-- YOLOv8 模型封装
-- 目标类别过滤
-- 返回最高置信度目标
+dist_px ≥ obj_size × CLOSE_DISTANCE_RATIO (0.65)
+  └──► APPROACHING →  emit "move_forward"
 
-`app/hand_tracker.py`
-职责:
-- MediaPipe Tasks 手部模型调用
-- 手势类别判定
-- 手部开合判定 (含回退启发式)
+hand_open == True
+  └──► GRASPING   →  emit "grasp"   ("握住目标")
 
-`app/guidance.py`
-职责:
-- 引导策略状态机
-- 冷却时间控制
-- 对齐/靠近/抓取流程
+hand_open == False (first time)
+  └──► SUCCESS    →  emit "success"
+```
 
-`app/config.py`
-职责:
-- 模型路径
-- 检测阈值
-- 引导阈值
-- 中文目标映射
+Where:
+- `Δx_norm = (obj_cx - hand_cx) / frame_W`
+- `dist_px = euclidean(hand_center, obj_center)`
+- `obj_size = max(obj_w, obj_h)`
 
 ---
 
-## 9. 配置与调参
+## 8. Configuration Reference
 
-主要配置在 `app/config.py`:
-- `DETECTION_CONF`, `DETECTION_IOU`
-- `HAND_DETECT_CONF`, `HAND_TRACK_CONF`
-- `XY_ALIGN_THRESHOLD`
-- `CLOSE_DISTANCE_RATIO`
-- `GUIDANCE_COOLDOWN_SEC`
+All in `app/config.py`. No environment variables or external config files.
 
-调参建议:
-- 召回不足: 适当降低 `DETECTION_CONF`
-- 引导过于敏感: 增大 `XY_ALIGN_THRESHOLD`
-- 抓取指令过早: 降低 `CLOSE_DISTANCE_RATIO`
+### Detection
 
----
+| Key | Default | Range | Notes |
+|---|---|---|---|
+| `YOLO_MODEL` | `"yolov8n.pt"` | any YOLO weights | `n`=fastest, `s/m/l/x`=more accurate |
+| `DETECTION_CONF` | `0.40` | 0.1–0.9 | Lower → more recall, more noise |
+| `DETECTION_IOU` | `0.45` | 0.1–0.9 | NMS threshold |
 
-## 10. 模型与资源
+### Hand Tracking
 
-- YOLOv8 模型: `yolov8n.pt`
-- MediaPipe 手势模型: `models/gesture_recognizer.task`
-- `models/hand_landmarker.task` 当前未接入
+| Key | Default | Notes |
+|---|---|---|
+| `MAX_HANDS` | `1` | Increase only with multi-hand guidance logic |
+| `HAND_DETECT_CONF` | `0.65` | Detection confidence (higher = fewer false positives) |
+| `HAND_TRACK_CONF` | `0.50` | Tracking confidence per frame |
 
-离线部署时请提前准备 MediaPipe 模型文件。
+### Guidance
 
----
+| Key | Default | Tuning guide |
+|---|---|---|
+| `XY_ALIGN_THRESHOLD` | `0.12` | Increase → guidance fires only when hand is further off-center. At 640 px: 0.12 → ±77 px |
+| `CLOSE_DISTANCE_RATIO` | `0.65` | Decrease → grasp phase triggers earlier (hand farther from object) |
+| `GUIDANCE_COOLDOWN_SEC` | `2.5` | Decrease → more frequent TTS; increase → quieter but slower feedback |
 
-## 11. 性能与稳定性
+### Adding Object Mappings
 
-- 前端默认 15 FPS 发送，兼顾延迟与识别稳定性
-- JPEG 质量 0.7
-- 后端处理繁忙时丢帧，避免堆积
-
-低配置设备建议:
-- 降低 `CAPTURE_FPS`
-- 降低摄像头分辨率
-- 替换更轻量 YOLO 模型
-
----
-
-## 12. 安全与隐私
-
-- 默认不持久化图像，仅在内存中处理
-- `localhost` 运行时数据不出本机
-- 对外部署需启用 HTTPS 与访问控制
+Add entries to `ZH_TO_COCO` to support new Chinese names:
+```python
+ZH_TO_COCO: dict[str, str] = {
+    "水壶": "bottle",
+    "保温杯": "cup",
+    # COCO-80 class names: https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml
+}
+```
 
 ---
 
-## 13. 测试指南
+## 9. Frontend Internals
 
-建议的手工测试路径:
-1. 启动服务并进入页面
-2. 允许摄像头权限
-3. WebSocket 状态显示已连接
-4. 通过按钮与语音设置目标
-5. 移动手部观察引导更新
-6. 观察框、关键点与方向箭头是否正确绘制
-7. 切换 TTS 功能
+### Camera & Capture (`app.js`)
+
+```
+startCamera()
+  ├── navigator.mediaDevices.getUserMedia({ video: {facingMode} })
+  ├── videoEl.srcObject = stream
+  ├── _applyMirror(facingMode === 'user')   ← CSS scaleX(-1) on video only
+  ├── _unlockTTS()                          ← iOS/Android audio unlock (user gesture required)
+  └── startFrameCapture()                   ← setInterval @ 15 fps
+
+_captureAndSend()
+  ├── drawImage(videoEl)  [raw frame, ignores CSS transform]
+  ├── if front camera: ctx.scale(-1,1) flip  ← server sees corrected orientation
+  └── toBlob(jpeg, 0.7) → ws.send(buf)
+```
+
+### Canvas Overlay
+
+`drawOverlay(state)` renders onto `#overlay-canvas` (positioned over `<video>`):
+- **Bounding box** — green rect + corner accents + center dot + label
+- **Hand skeleton** — 21 keypoints + HAND_CONNECTIONS edges (green=open, blue=closed)
+- **Hand center** — circle at palm center
+- **Direction arrow** — line + arrowhead from hand center toward object center
+
+> Canvas is **not** CSS-transformed. Server coordinates (from flipped frame) align directly with the CSS-mirrored video display. Applying CSS mirror to the canvas would double-flip all overlays.
+
+### TTS (Web Speech API)
+
+```
+speak(text)
+  ├── deduplicate: skip if same as last queued
+  ├── speechSynthesis.cancel()   ← abort stale speech immediately
+  └── drainTTS()
+        └── SpeechSynthesisUtterance(text)
+              lang='zh-CN', rate=1.1
+              prefer zhVoice → fallback to browser default
+              speechSynthesis.speak(utt)
+
+_unlockTTS()    ← called once from startCamera() (user gesture context)
+  └── speak silent utterance (volume=0) to unlock mobile audio
+```
+
+**iOS/Android note:** `speechSynthesis.speak()` is blocked until the first call within a user-gesture handler. `_unlockTTS()` fires a silent utterance during the camera-start click to satisfy this requirement.
+
+### ASR (Web Speech API)
+
+```
+toggleASR()
+  └── SpeechRecognition({ lang: 'zh-CN', interimResults: false })
+        onresult → setTarget(transcript)   ← sends WS set_target
+```
 
 ---
 
-## 14. 常见问题
+## 10. Running the Server
 
-相机无法启动:
-- 使用 Chrome/Edge
-- 检查浏览器权限设置
+### `run.py` CLI
 
-WebSocket 未连接:
-- 确认服务启动于 `http://localhost:8000`
-- 查看浏览器控制台错误
+```
+python run.py [--https] [--port PORT]
+```
 
-模型下载失败:
-- 手动放置 `models/gesture_recognizer.task`
+| Flag | Default | Description |
+|---|---|---|
+| `--https` | off | Start HTTPS server on port 8443 in addition to HTTP on 8000 |
+| `--port` | `8000` | HTTP port (HTTPS always uses 8443) |
 
-控制台中文乱码:
-- 确保终端编码为 UTF-8
+### Dual-server mode (`--https`)
 
----
+```python
+# HTTP on port 8000 (background thread, own event loop)
+threading.Thread(target=_run_server, kwargs={host, port=8000}).start()
 
-## 15. 扩展方向
+# HTTPS on port 8443 (main thread, blocks)
+_run_server(host, port=8443, ssl_certfile, ssl_keyfile)
+```
 
-- 多目标跟踪与优先级
-- 多手识别
-- 语音个性化与语言切换
-- 模型量化与加速
-- 摄像头自动标定
+Both servers share the same `app.main` module import → same `FrameProcessor` singleton.
 
----
+### TLS Certificate
 
-## 16. 维护规范
-
-- CV/ML 逻辑集中在 `app/`
-- UI 改动集中在 `static/`
-- 协议变更同步更新本文档
+Auto-generated via `cryptography` if `cert.pem` / `key.pem` are absent:
+- RSA 2048, valid 365 days
+- SAN: `localhost`, `127.0.0.1`, detected LAN IP
 
 ---
 
-## 17. 代码引用
+## 11. Performance & Tuning
 
-后端:
-- `D:\pyproject\CVP\app\main.py`
-- `D:\pyproject\CVP\app\camera_processor.py`
-- `D:\pyproject\CVP\app\detector.py`
-- `D:\pyproject\CVP\app\hand_tracker.py`
-- `D:\pyproject\CVP\app\guidance.py`
-- `D:\pyproject\CVP\app\config.py`
+### Baseline (RTX 5070 Laptop, 640×480 @ 15 fps)
 
-前端:
-- `D:\pyproject\CVP\static\index.html`
-- `D:\pyproject\CVP\static\app.js`
-- `D:\pyproject\CVP\static\style.css`
+| Stage | Typical latency |
+|---|---|
+| JPEG decode | ~1 ms |
+| YOLOv8n (GPU) | ~8–12 ms |
+| MediaPipe Gesture (CPU XNNPACK) | ~15–25 ms |
+| Guidance + serialise | < 1 ms |
+| **End-to-end server** | ~25–40 ms |
 
-入口与依赖:
-- `D:\pyproject\CVP\run.py`
-- `D:\pyproject\CVP\requirements.txt`
+### Reducing latency on low-end hardware
 
+1. Lower capture FPS: `const CAPTURE_FPS = 10` in `app.js`
+2. Lower resolution: set `width: { ideal: 320 }, height: { ideal: 240 }` in `getUserMedia` constraints
+3. Switch to lighter model: `YOLO_MODEL = "yolov8n.pt"` (already the lightest)
+4. JPEG quality: `toBlob('image/jpeg', 0.5)` — reduces bandwidth, slightly lower accuracy
+
+### Back-pressure
+
+If `proc_lock` is held when a new frame arrives, the frame is dropped (not queued). This prevents unbounded memory growth and ensures the UI always reflects the latest camera state.
+
+---
+
+## 12. Troubleshooting
+
+### WebSocket shows "连接中" (connecting loop)
+
+**Symptom:** Status badge never turns green; recognition doesn't work.
+**Cause:** WebSocket handler crashed with `RuntimeError: Cannot call "receive" once a disconnect message has been received`.
+**Fix:** Already patched in `main.py` — ensure `raw.get("type") == "websocket.disconnect"` check is present and `except (WebSocketDisconnect, RuntimeError)` catches both.
+
+### Camera not starting on mobile
+
+**Cause:** `getUserMedia` requires HTTPS on non-localhost origins.
+**Fix:** Run with `python run.py --https` and access via `https://<LAN-IP>:8443`.
+
+### No TTS audio on mobile
+
+**Cause:** iOS/Android block `speechSynthesis.speak()` until a user-gesture call.
+**Fix:** `_unlockTTS()` is called inside `startCamera()` (button click context). Ensure it fires before any guidance message arrives.
+
+### Hand not detected
+
+- Ensure adequate lighting (MediaPipe struggles in very low light)
+- Keep hand within the center 80% of frame
+- If `HAND_DETECT_CONF` is too high, lower it to `0.50`
+
+### MediaPipe timestamp error
+
+**Symptom:** `Timestamp must be monotonically increasing`.
+**Fix:** Already patched in `hand_tracker.py` — `ts_ms = max(perf_counter_ms - t0, last_ts + 1)`.
+
+### Chinese characters garbled in terminal (Windows)
+
+```bash
+set PYTHONIOENCODING=utf-8   # before running python run.py
+```
+
+### Model download fails
+
+Manually place models in `models/`:
+- `gesture_recognizer.task` — [download from Google](https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task)
+- `yolov8n.pt` — [download from Ultralytics](https://github.com/ultralytics/assets/releases)
+
+---
+
+## 13. Extension Points
+
+### Adding new supported objects
+
+Edit `ZH_TO_COCO` in `config.py` and add a quick-pick button in `index.html`.
+
+### Supporting additional languages
+
+1. Add ASR language: change `recognition.lang` in `app.js`
+2. Add TTS voice: add a new `GUIDANCE_TEXTS_XX` dict in `config.py`
+3. Send language preference via WebSocket and switch in `GuidancePolicy._emit()`
+
+### Multi-hand guidance
+
+1. Increase `MAX_HANDS` in `config.py`
+2. Modify `HandTracker.track()` to return all landmark sets
+3. Update `FrameProcessor` to select the hand closest to target
+
+### Depth estimation (replacing "move forward")
+
+Replace the `CLOSE_DISTANCE_RATIO` heuristic with a depth model (e.g. MiDaS) to provide metric distance guidance. Hook into `FrameProcessor.process_frame()` after the existing detection steps.
+
+### Recording / logging
+
+`FrameProcessor.process_frame()` returns a full state dict on every call. Add a logging hook there to record sessions for evaluation or replay.
+
+---
+
+*For questions about the project, open an issue in the repository.*
+]]>

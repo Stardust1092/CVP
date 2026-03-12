@@ -71,6 +71,7 @@ class HandTracker:
         )
         self._recognizer = GestureRecognizer.create_from_options(options)
         self._t0_ms = int(time.perf_counter() * 1000)
+        self._last_ts_ms: int = -1
         self._last_gesture: str = "None"
 
     def track(self, frame: np.ndarray) -> list | None:
@@ -82,7 +83,12 @@ class HandTracker:
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        ts_ms = int(time.perf_counter() * 1000) - self._t0_ms
+        # MediaPipe VIDEO mode requires strictly increasing timestamps
+        ts_ms = max(
+            int(time.perf_counter() * 1000) - self._t0_ms,
+            self._last_ts_ms + 1,
+        )
+        self._last_ts_ms = ts_ms
         result = self._recognizer.recognize_for_video(mp_image, ts_ms)
 
         if result.hand_landmarks:

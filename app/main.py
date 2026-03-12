@@ -41,7 +41,7 @@ app = FastAPI(
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     proc_lock = asyncio.Lock()
 
     try:
@@ -50,6 +50,10 @@ async def ws_endpoint(ws: WebSocket):
                 raw = await asyncio.wait_for(ws.receive(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+
+            # WebSocket disconnect delivered as a message (Starlette low-level API)
+            if raw.get("type") == "websocket.disconnect":
+                break
 
             # ── Binary message: JPEG frame from browser camera ───────────────
             if raw.get("bytes"):
@@ -89,7 +93,7 @@ async def ws_endpoint(ws: WebSocket):
                     processor.clear_target()
                     await ws.send_json({"type": "target_cleared"})
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
 
 
